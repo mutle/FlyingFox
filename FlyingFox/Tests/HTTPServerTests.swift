@@ -39,6 +39,83 @@ import Testing
 
 actor HTTPServerTests {
 
+    @Test(arguments: [nil, "close", "Upgrade"], [nil, "keep-alive"])
+    func terminatingResponsesAdvertiseClose(connection: String?, handlerConnection: String?) async throws {
+        let server = HTTPServer.make { _ in
+            var response = HTTPResponse(statusCode: .ok, body: Data("ok".utf8))
+            response.headers[.connection] = handlerConnection
+            return response
+        }
+        var request = HTTPRequest.make()
+        request.headers[.connection] = connection
+        if connection == "Upgrade" { request.headers[.upgrade] = "websocket" }
+        let response = await server.handleRequest(request)
+        #expect(response.headers[.connection] == "close")
+        #expect(try await response.bodyData == Data("ok".utf8))
+    }
+
+    @Test
+    func generatedErrorResponsesAdvertiseClose() async throws {
+        let server = HTTPServer.make()
+        await server.appendRoute("/error") { _ in throw SocketError.disconnected }
+        let missing = await server.handleRequest(.make(path: "/missing"))
+        let failed = await server.handleRequest(.make(path: "/error"))
+        #expect(missing.statusCode == .notFound)
+        #expect(failed.statusCode == .internalServerError)
+        #expect(missing.headers[.connection] == "close")
+        #expect(failed.headers[.connection] == "close")
+    }
+
+    @Test
+    func upgradeResponsesPreserveConnectionHeaders() async throws {
+        let server = HTTPServer.make()
+        await server.appendRoute("/websocket") { _ in
+            var response = HTTPResponse(headers: [.connection: "upgrade", .upgrade: "websocket"],
+                                        webSocket: MessageFrameWSHandler(handler: EchoWSMessageHandler()))
+            // Exercise the payload exclusion independently of the 101 status exclusion.
+            response.statusCode = .ok
+            return response
+        }
+        await server.appendRoute("/switching") { _ in
+            HTTPResponse(statusCode: .switchingProtocols, headers: [.connection: "upgrade", .upgrade: "custom"])
+        }
+        let webSocket = await server.handleRequest(.make(path: "/websocket"))
+        let switching = await server.handleRequest(.make(path: "/switching"))
+        #expect(webSocket.headers[.connection] == "upgrade")
+        #expect(webSocket.headers[.upgrade] == "websocket")
+        if case .webSocket = webSocket.payload {} else { Issue.record("WebSocket payload was replaced") }
+        #expect(switching.headers[.connection] == "upgrade")
+        #expect(switching.headers[.upgrade] == "custom")
+        #expect(switching.statusCode == .switchingProtocols)
+    }
+
+    @Test(arguments: [nil, "close", "Keep-Alive"])
+    func responseClosurePolicyOnWire(connection: String?) async throws {
+        let server = HTTPServer.make { request in
+            HTTPResponse(statusCode: .ok, headers: [.connection: "keep-alive"],
+                         body: try await request.bodyData)
+        }
+        let port = try await startServerWithPort(server)
+        try await withThrowingTimeout(seconds: 3) {
+            let socket = try await AsyncSocket.connected(to: .inet(ip4: "127.0.0.1", port: port))
+            defer { try! socket.close() }
+            let count = connection == "Keep-Alive" ? 2 : 1
+            for index in 0..<count {
+                var request = HTTPRequest.make(method: .POST, body: Data("body-\(index)".utf8))
+                request.headers[.connection] = index == 0 ? connection : "close"
+                try await socket.writeRequest(request)
+                let response = try await socket.readResponse()
+                #expect(response.statusCode == .ok)
+                #expect(response.headers[.connection] == (count == 2 && index == 0 ? "Keep-Alive" : "close"))
+                #expect(response.headers[.contentLength] == "6")
+                #expect(try await response.bodyData == Data("body-\(index)".utf8))
+            }
+            await #expect(throws: SocketError.disconnected) {
+                _ = try await socket.read()
+            }
+        }
+    }
+
     private var stopServer: HTTPServer?
 
     func startServerWithPort(_ server: HTTPServer, preferConnectionsDiscarding: Bool = true) async throws -> UInt16 {
@@ -634,4 +711,3 @@ extension Task where Success == Never, Failure == Never {
         try await sleep(nanoseconds: UInt64(1_000_000_000 * seconds))
     }
 }
-

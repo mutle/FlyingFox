@@ -245,6 +245,8 @@ public final actor HTTPServer {
         var response = await handleRequest(request, timeout: config.timeout)
         if request.shouldKeepAlive {
             response.headers[.connection] = request.headers[.connection]
+        } else if case .httpBody = response.payload, response.statusCode != .switchingProtocols {
+            response.headers[.connection] = "close"
         }
         return response
     }
