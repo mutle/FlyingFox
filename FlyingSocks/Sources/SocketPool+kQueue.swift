@@ -76,12 +76,9 @@ public struct kQueue: EventQueue {
 
     public mutating func addEvents(_ events: Socket.Events, for socket: Socket.FileDescriptor) throws {
         for event in events {
-            var socketEvents = existing[socket] ?? []
-            if !socketEvents.contains(event) {
-                try addEvent(event, for: socket)
-                socketEvents.insert(event)
-                existing[socket] = socketEvents
-            }
+            // Closing a socket removes kernel interests, even if its descriptor is reused.
+            try addEvent(event, for: socket)
+            existing[socket, default: []].insert(event)
         }
     }
 
@@ -100,19 +97,29 @@ public struct kQueue: EventQueue {
     }
 
     public mutating func removeEvents(_ events: Socket.Events, for socket: Socket.FileDescriptor) throws {
-        for event in events {
-            if var entries = existing[socket] {
-                if entries.contains(event) {
-                    try removeEvent(event, for: socket)
+        try removeEvents(events, for: socket, using: removeEvent)
+    }
+
+    mutating func removeEvents(_ events: Socket.Events,
+                               for socket: Socket.FileDescriptor,
+                               using remove: (Socket.Event, Socket.FileDescriptor) throws -> Void) throws {
+        guard var entries = existing[socket] else { return }
+        var firstError: (any Error)?
+        for event in events where entries.contains(event) {
+            do {
+                try remove(event, socket)
+                entries.remove(event)
+            } catch {
+                if firstError == nil { firstError = error }
+                if let socketError = error as? SocketError,
+                   case .failed(_, let code, _) = socketError,
+                   code == ENOENT || code == EBADF {
                     entries.remove(event)
-                    if entries.isEmpty {
-                        existing[socket] = nil
-                    } else {
-                        existing[socket] = entries
-                    }
                 }
             }
         }
+        existing[socket] = entries.isEmpty ? nil : entries
+        if let firstError { throw firstError }
     }
 
     func removeEvent(_ event: Socket.Event, for socket: Socket.FileDescriptor) throws {
